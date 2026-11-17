@@ -1,0 +1,31 @@
+{
+  "providers": {
+    "mlx": {
+      "baseUrl": "http://host.docker.internal:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "not-needed",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "supportsStore": false,
+        "maxTokensField": "max_tokens",
+        "thinkingFormat": "qwen-chat-template"
+      },
+      "models": [
+        {
+          "id": "default_model",
+          "name": "Default model (hush replaces this list at start-up)",
+          "reasoning": true,
+          "contextWindow": 65536,
+          "maxTokens": 16384,
+          "thinkingLevelMap": {
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "xhigh": null
+          }
+        }
+      ]
+    }
+  }
+}

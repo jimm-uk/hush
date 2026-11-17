@@ -1,0 +1,22 @@
+# client data and experiments: never public
+work/
+
+# local state: venv, sessions, logs, retired-kit tarball
+.hush/
+
+# tooling / OS
+.claude/
+**/.claude/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+__pycache__/
+*.log
+
+# secrets
+.env
+.env.*
+
+HISTORY.md

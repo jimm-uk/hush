@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+# hush — private, offline AI document work: Pi in a Docker Sandbox (sbx), driven by local MLX models
+# Everything runs on this Mac; the sandbox has no internet access.
+#
+# Run it from the folder you want Pi to work on. Each session gets a throwaway
+# sandbox (one generic kit, kit/hush-sandbox) with that folder, and only that
+# folder, mounted; the sandbox is deleted when Pi exits. The first time in a
+# folder you are asked to confirm the mount. Pi's session history (/resume) is
+# kept per folder in .hush/sessions/. Run from hush's own folder, it uses ./work.
+#
+#   hush setup          one-time: policy preset, build the kit image (needs network)
+#   hush [-y]           start MLX server if needed, then attach Pi
+#                       (-y: don't ask before mounting a new folder)
+#                       Asks each start whether to allow internet for the session;
+#                       --online / --offline answer in advance. Off when Pi exits.
+#   hush where          show the folder and sandbox the current directory maps to
+#                       If the MLX server isn't running, asks which model to load
+#                       (Enter = default; HUSH_MODEL=... skips the menu).
+#   hush serve|stop|status|logs|mem   manage the host MLX server
+#   hush models         list local models + refresh Pi's /model list
+#   hush shell          bash in a sandbox for this folder (throwaway unless Pi is running)
+#   hush verify         check model reachable + internet blocked, from inside
+#   hush build          build/refresh the kit image now (otherwise done on first use
+#                       after a kit change; rebuild is an alias)
+#   hush rm             delete a sandbox left behind for this folder
+#   hush forget         forget this folder: mount approval + Pi session history
+#
+# Env overrides: HUSH_MODEL=<path | folder name in $HUSH_MODELS_ROOT>  HUSH_PORT=8080
+#                HUSH_MODELS_ROOT=~/models  HUSH_DEFAULT_MODEL=<publisher/folder>
+#                HUSH_BIND=127.0.0.1  SBX_MEMORY=8g
+#                HUSH_WORKSPACE=<folder to mount instead of the current one>
+#                HUSH_SBX_NAME=<sandbox name instead of the derived one>
+#                HUSH_NET=ask|on|off (internet for the session; default ask)
+#                HUSH_YES=1 (same as -y)  HUSH_STOP_ON_EXIT=ask|yes|no (MLX server, when Pi exits)
+#                HUSH_CACHE_N=2  HUSH_CACHE_BYTES=6GB   (MLX KV-cache caps)
+#                MLX_CACHE_LIMIT=2GB  MLX_WIRED_LIMIT=<weights+2GB>  MLX_MEM_LOG=60
+set -euo pipefail
+
+# Where hush was called from (before we cd away), and hush's own folder with
+# symlinks resolved, so a symlink to this script on PATH works too.
+CALLER_PWD="$(pwd -P)"
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do
+  SELF_DIR="$(cd -P "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  [[ "$SELF" == /* ]] || SELF="$SELF_DIR/$SELF"
+done
+ROOT="$(cd -P "$(dirname "$SELF")" && pwd)"
+cd "$ROOT"
+
+# -y / --yes anywhere on the command line: don't ask before mounting.
+YES=""
+[[ "${HUSH_YES:-0}" == 0 ]] || YES=1
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    -y|--yes)  YES=1 ;;
+    --online)  HUSH_NET=on ;;
+    --offline) HUSH_NET=off ;;
+    *)         ARGS+=("$a") ;;
+  esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+# Folder to mount: HUSH_WORKSPACE, else the caller's directory. From inside
+# hush's own folder it is ./work, so the script and kit are never mounted.
+if [[ -n "${HUSH_WORKSPACE:-}" ]]; then
+  WORKSPACE="$HUSH_WORKSPACE"
+  [[ "$WORKSPACE" == /* ]] || WORKSPACE="$CALLER_PWD/$WORKSPACE"
+  [[ ! -d "$WORKSPACE" ]] || WORKSPACE="$(cd -P "$WORKSPACE" && pwd)"
+elif [[ "$CALLER_PWD/" == "$ROOT/"* ]]; then
+  WORKSPACE="$ROOT/work"
+else
+  WORKSPACE="$CALLER_PWD"
+fi
+
+# Sandbox name, derived from the path: hush-<folder>-<6 hex of path hash>.
+sbx_name() {
+  if [[ -n "${HUSH_SBX_NAME:-}" ]]; then echo "$HUSH_SBX_NAME"; return; fi
+  local slug hash
+  slug="$(basename "$WORKSPACE" | tr '[:upper:]' '[:lower:]' \
+          | LC_ALL=C sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-//' | cut -c1-40 | sed 's/-$//')"
+  echo "hush-${slug:+$slug-}${WSHASH:0:6}"
+}
+WSHASH="$(printf '%s' "$WORKSPACE" | shasum | cut -c1-16)"
+NAME="$(sbx_name)"
+KIT="./kit/hush-sandbox"
+PORT="${HUSH_PORT:-8080}"
+BIND="${HUSH_BIND:-127.0.0.1}"
+STATE="$ROOT/.hush"
+PIDFILE="$STATE/mlx.pid"
+LOG="$STATE/mlx.log"
+# Folders the user has agreed to mount (one path per line).
+APPROVED="$STATE/approved"
+# Pi's session history for this folder, mounted over ~/.pi/agent/sessions.
+SESSIONS="$STATE/sessions/$WSHASH"
+PI_SESSIONS=/home/agent/.pi/agent/sessions
+# Model library (<publisher>/<repo>/ folders). LM Studio is pointed here too.
+MODELS_ROOT="${HUSH_MODELS_ROOT:-$HOME/models}"
+# Model served as "default_model" when HUSH_MODEL is unset (best in testing).
+DEFAULT_MODEL="${HUSH_DEFAULT_MODEL:-lmstudio-community/Qwen3.6-35B-A3B-MLX-8bit}"
+
+mkdir -p "$STATE"
+for v in $(compgen -e | grep '^QWEN_' || true); do
+  printf '\033[33mwarn:\033[0m %s is no longer used; variables are now HUSH_* (see --help)\n' "$v" >&2
+done
+
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
+
+# confirm "question": 0 = yes, 1 = no, 2 = no terminal to ask on.
+confirm() {
+  local ans
+  { : >/dev/tty; } 2>/dev/null || return 2
+  printf '%s [y/N] ' "$1" >/dev/tty
+  read -r ans </dev/tty || return 1
+  [[ "$ans" == [yY] || "$ans" == [yY][eE][sS] ]]
+}
+
+# Refuse folders that would expose far more than one project to the agent, or
+# hush itself: the script and kit run on the host, so the sandbox must not be
+# able to edit them.
+check_workspace() {
+  local w="$WORKSPACE" home
+  home="$(cd -P "$HOME" && pwd)"
+  [[ "$w" != / && "$home/" != "$w/"* ]] \
+    || die "refusing to mount $w: it is, or contains, your home folder. cd into a project folder first."
+  [[ "$ROOT/" != "$w/"* ]] \
+    || die "refusing to mount $w: it contains hush itself ($ROOT)."
+  [[ "$w/" != "$ROOT/"* || "$w/" == "$ROOT/work/"* ]] \
+    || die "refusing to mount $w: inside hush's own folder only work/ may be mounted."
+}
+
+pick_model_dir() {
+  # Model served as "default_model". HUSH_MODEL is a path, or a folder name
+  # ("Qwen3.8-27B-MLX-6bit" or "publisher/folder") looked up in $MODELS_ROOT.
+  # With a server already up, that is whatever it was started with.
+  if [[ -z "${HUSH_MODEL:-}" && -s "$STATE/mlx.model" ]] && server_up; then cat "$STATE/mlx.model"; return; fi
+  local m="${HUSH_MODEL:-$DEFAULT_MODEL}" hit
+  if [[ "$m" == /* || "$m" == ./* ]]; then echo "$m"; return; fi
+  if [[ -d "$MODELS_ROOT/$m" ]]; then echo "$MODELS_ROOT/$m"; return; fi
+  hit="$(ls -d "$MODELS_ROOT"/*/"$m" 2>/dev/null | head -1)"
+  echo "${hit:-$MODELS_ROOT/$m}"
+}
+
+# Rebuild Pi's model list from every MLX chat model in $MODELS_ROOT and push it
+# into the sandbox (Pi re-reads it each time /model opens).
+sync_models() {
+  local out="$STATE/pi-models.json"
+  /usr/bin/python3 -I "$ROOT/pi_models.py" "$MODELS_ROOT" "$(pick_model_dir)" >"$out" || { warn "model scan failed; keeping Pi's existing list"; return; }
+  sbx exec -i "$NAME" bash -c 'cat > ~/.pi/agent/models.json' <"$out" >/dev/null 2>&1 \
+    && info "Pi model list: $(grep -c '"id"' "$out") models from $MODELS_ROOT" \
+    || warn "couldn't update Pi's model list in '$NAME'"
+  # hush-anon needs the host path too (the MLX server loads models by it).
+  printf '%s\n' "$MODELS_ROOT" | sbx exec -i "$NAME" bash -c 'cat > ~/.pi/agent/models-root' >/dev/null 2>&1 \
+    || warn "couldn't tell hush-anon where models are in '$NAME'"
+}
+
+mlx_bin() {
+  local b
+  b="$(command -v mlx_lm.server 2>/dev/null \
+       || ls /Library/Frameworks/Python.framework/Versions/*/bin/mlx_lm.server 2>/dev/null | tail -1)"
+  [[ -n "$b" ]] || die "mlx_lm.server not found (pip install mlx-lm)"
+  echo "$b"
+}
+
+server_up() { curl -fsS -m 2 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; }
+
+# If the server has to be started anyway, offer the model menu first. Enter
+# takes the default. Skipped when HUSH_MODEL is set or there is no terminal.
+choose_model() {
+  [[ -z "${HUSH_MODEL:-}" ]] || return 0
+  ! server_up || return 0
+  { : >/dev/tty; } 2>/dev/null || return 0
+  local dirs=() names=() d n i ans
+  while IFS=$'\t' read -r d n; do dirs+=("$d"); names+=("$n"); done \
+    < <(/usr/bin/python3 -I "$ROOT/pi_models.py" "$MODELS_ROOT" "$(pick_model_dir)" --pick 2>/dev/null)
+  [[ ${#dirs[@]} -gt 1 ]] || return 0
+  {
+    echo "Model to load:"
+    for i in "${!dirs[@]}"; do printf '  %2d) %s\n' $((i + 1)) "${names[$i]}"; done
+  } >/dev/tty
+  while :; do
+    printf 'Number [1]: ' >/dev/tty
+    read -r ans </dev/tty || return 0
+    [[ -n "$ans" ]] || ans=1
+    if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#dirs[@]} )); then break; fi
+  done
+  export HUSH_MODEL="${dirs[$((ans - 1))]}"
+}
+
+serve() {
+  if server_up; then info "MLX server already up on :$PORT"; return; fi
+  local model; model="$(pick_model_dir)"
+  [[ -f "$model/config.json" ]] || die "model not found: $model"
+  info "starting mlx_lm.server: $(basename "$model") on $BIND:$PORT (log: $LOG)"
+  # Offline: never let the server reach out to Hugging Face.
+  # Memory caps. mlx_lm defaults keep up to 10 KV caches with NO byte limit and
+  # batch 32 decodes — with a 128k context that can eat all RAM. One agent
+  # needs ~2 cached prompts (main + title/summary calls).
+  # mlx_serve.py also caps MLX's buffer pool and wired memory, and logs [mem].
+  # Thinking off unless the client asks (Pi: shift+tab / thinking level 'high').
+  local tmpl_args='{"enable_thinking":false}'
+  tmpl_args="${HUSH_TEMPLATE_ARGS:-$tmpl_args}"
+  # Prefer hush's private venv (newer mlx-lm; system Python left untouched).
+  local py="$STATE/venv/bin/python"
+  [[ -x "$py" ]] || py="$(head -1 "$(mlx_bin)" | sed 's/^#! *//')"
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 nohup $py "$ROOT/mlx_serve.py" \
+    --model "$model" --host "$BIND" --port "$PORT" \
+    --prompt-cache-size "${HUSH_CACHE_N:-2}" \
+    --prompt-cache-bytes "${HUSH_CACHE_BYTES:-6GB}" \
+    --decode-concurrency 2 --prompt-concurrency 1 \
+    --chat-template-args "$tmpl_args" >"$LOG" 2>&1 &
+  echo $! >"$PIDFILE"
+  echo "$model" >"$STATE/mlx.model"
+  printf 'waiting for model to load'
+  for _ in $(seq 1 300); do
+    if server_up; then echo; info "MLX server ready"; return; fi
+    kill -0 "$(cat "$PIDFILE")" 2>/dev/null || { echo; tail -20 "$LOG"; die "server exited"; }
+    printf '.'; sleep 1
+  done
+  echo; die "server not ready after 300s — see $LOG"
+}
+
+stop_server() {
+  if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    kill "$(cat "$PIDFILE")" && info "stopped MLX server"
+  else
+    info "no MLX server started by this script is running"
+  fi
+  rm -f "$PIDFILE" "$STATE/mlx.model"
+}
+
+need_sbx() {
+  command -v sbx >/dev/null || die "sbx not installed. Run:
+    brew trust docker/tap && brew install docker/tap/sbx && sbx login"
+}
+
+sandbox_exists()  { sbx ls 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$NAME"; }
+sandbox_running() { sbx ls 2>/dev/null | awk -v n="$NAME" 'NR>1 && $1==n' | grep -qi running; }
+is_approved()     { [[ -f "$APPROVED" ]] && grep -qxF "$WORKSPACE" "$APPROVED"; }
+
+# Ask once per folder before mounting it (-y / HUSH_YES skip the question).
+approve() {
+  is_approved && return 0
+  if [[ -z "$YES" ]]; then
+    local rc=0
+    confirm "Mount $WORKSPACE read-write into hush sandboxes?" || rc=$?
+    [[ $rc -ne 2 ]] || die "no terminal to confirm mounting $WORKSPACE (re-run with -y to skip the question)"
+    [[ $rc -eq 0 ]] || die "aborted; nothing was mounted"
+  fi
+  echo "$WORKSPACE" >>"$APPROVED"
+}
+
+# Create this folder's throwaway sandbox. The kit image is cached by content,
+# so this takes seconds unless the kit changed (then it is rebuilt first).
+create() {
+  check_workspace
+  approve
+  mkdir -p "$WORKSPACE" "$SESSIONS"
+  chmod 700 "$STATE/sessions" "$SESSIONS"
+  info "creating sandbox '$NAME' (workspace: $WORKSPACE)"
+  # Default would be 50% of host RAM (32 GiB); the tooling needs far less.
+  sbx create --name "$NAME" --memory "${SBX_MEMORY:-8g}" "$KIT" \
+    "$WORKSPACE" "$SESSIONS:$PI_SESSIONS" >/dev/null
+  # The kit opens the MLX port too; this per-sandbox rule makes sure of it.
+  sbx policy allow network --sandbox "$NAME" "localhost:$PORT" >/dev/null 2>&1 || true
+}
+
+destroy() { sbx rm --force "$NAME" >/dev/null 2>&1 || true; }
+
+# For shell/verify: use the running session's sandbox if there is one,
+# otherwise a throwaway one that is removed when the command ends.
+with_sandbox() {
+  if sandbox_running; then "$@"; return; fi
+  sandbox_exists && destroy
+  create
+  trap destroy EXIT
+  "$@"
+}
+
+# Build the kit image without mounting anything: a sandbox with no workspace,
+# removed straight away. sbx rebuilds only when the kit's content changed.
+build() {
+  local tmp="hush-build-$$"
+  info "building kit image ($KIT); the first build takes several minutes"
+  sbx create --name "$tmp" --memory "${SBX_MEMORY:-8g}" "$KIT"
+  sbx rm --force "$tmp" >/dev/null 2>&1 || true
+  info "kit image ready"
+}
+
+setup() {
+  need_sbx
+  info "setting network preset to Locked Down (deny-all) if none is set yet"
+  if ! sbx policy init deny-all 2>/dev/null; then
+    warn "a preset already exists. If it is 'balanced', package registries etc. are
+      reachable from ALL sandboxes. To lock down: sbx policy reset  (choose Locked Down)"
+  fi
+  info "disabling bundled llmman service (not used; avoids its runtime download)"
+  sbx settings set model.server.enabled false || true
+  sbx daemon restart || true
+  build
+  info "done. Start with: hush"
+}
+
+# After Pi exits: offer to stop the MLX server this script started. Default is
+# no, since a Pi session in another folder may still be using it.
+maybe_stop_server() {
+  [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null || return 0
+  case "${HUSH_STOP_ON_EXIT:-ask}" in
+    yes) stop_server ;;
+    no)  ;;
+    *)   if confirm "Stop the MLX server (frees the model's memory)?"; then stop_server
+         else info "MLX server left running. Stop it later with: hush stop"; fi ;;
+  esac
+}
+
+# Internet access is per session: a sandbox-scoped allow-all rule, added when
+# you say yes at start and removed again when Pi exits. Every start enforces
+# the choice, so a rule left behind by a killed session doesn't linger.
+NET_RULE='**'
+net_on()  { sbx policy allow network --sandbox "$NAME" "$NET_RULE" >/dev/null 2>&1 || true; }
+net_off() { sbx policy rm network --sandbox "$NAME" --resource "$NET_RULE" --force >/dev/null 2>&1 || true; }
+net_reachable() { sbx exec "$NAME" curl -fsS -m 6 -o /dev/null https://example.com >/dev/null 2>&1; }
+
+want_net() {   # 0 = internet on for this session
+  case "${HUSH_NET:-ask}" in
+    on)  return 0 ;;
+    off) return 1 ;;
+    *)   confirm "Allow internet access from the sandbox for this session?" ;;
+  esac
+}
+
+run() {
+  need_sbx
+  if sandbox_running; then
+    die "a hush session for $WORKSPACE is already running (sandbox '$NAME'). Use it, or close it first."
+  fi
+  sandbox_exists && destroy   # left behind by a killed session
+  # Ask the questions before spending time loading the model.
+  create
+  trap destroy EXIT
+  trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+  local online=""
+  if want_net; then online=1; fi
+  choose_model
+  serve
+  sync_models
+  # Apply the choice, then test it from inside rather than trusting the rule.
+  if [[ -n "$online" ]]; then
+    net_on
+    if net_reachable; then
+      warn "INTERNET IS ON for this session: anything in $WORKSPACE can be sent out. The sandbox is deleted when Pi exits."
+    else
+      warn "internet was requested, but example.com is not reachable from '$NAME' (see: sbx policy log)"
+    fi
+  else
+    net_off
+    ! net_reachable || die "internet is reachable from '$NAME' although offline was chosen; not attaching. Check: sbx policy ls"
+    info "internet: blocked"
+  fi
+  info "workspace: $WORKSPACE  ->  sandbox '$NAME'"
+  info "attaching Pi in '$NAME'"
+  local rc=0
+  sbx run --name "$NAME" || rc=$?
+  net_off; destroy; trap - EXIT
+  info "sandbox '$NAME' removed"
+  maybe_stop_server
+  return $rc
+}
+
+verify() {
+  need_sbx
+  server_up || warn "MLX server not running on host (hush serve)"
+  with_sandbox verify_inside
+}
+verify_inside() {
+  sbx exec "$NAME" bash -c "
+    printf 'model endpoint  : '; curl -fsS -m 10 http://host.docker.internal:$PORT/v1/models >/dev/null && echo OK || echo FAILED
+    for u in https://pypi.org https://github.com https://example.com https://huggingface.co; do
+      printf '%-16s: ' \"\${u#https://}\"
+      curl -fsS -m 6 -o /dev/null \"\$u\" 2>/dev/null && echo 'REACHABLE  <-- not isolated!' || echo blocked
+    done
+    printf 'pi              : '; pi --version 2>/dev/null | tail -1
+    printf 'node / npm      : '; command -v node npm >/dev/null 2>&1 && echo present || echo absent
+    printf 'office python   : '; python -c 'import docx, openpyxl, pptx; print(\"OK\")'
+    printf 'anon tooling    : '; python -c 'import pymupdf, spacy, presidio_analyzer; spacy.load(\"en_core_web_lg\"); print(\"OK\")'
+    printf 'libreoffice     : '; soffice --version | head -1
+    printf 'pi sessions dir : '; touch $PI_SESSIONS/.w 2>/dev/null && rm -f $PI_SESSIONS/.w && echo 'mounted, writable' || echo FAILED
+  "
+}
+
+case "${1:-run}" in
+  run)      run ;;
+  setup)    setup ;;
+  serve)    choose_model; serve ;;
+  stop)     stop_server ;;
+  status)   server_up && info "MLX up on :$PORT" || info "MLX down"; need_sbx; sbx ls ;;
+  logs)     tail -f "$LOG" ;;
+  models)   /usr/bin/python3 -I "$ROOT/pi_models.py" "$MODELS_ROOT" "$(pick_model_dir)" --list; need_sbx
+            if sandbox_running; then sync_models; else info "Pi's /model list is refreshed at every start"; fi ;;
+  mem)      grep "\[mem\]" "$LOG" | tail -${2:-10} ;;
+  shell)    need_sbx; with_sandbox sbx exec -it "$NAME" bash ;;
+  verify)   verify ;;
+  where)    printf 'workspace: %s\nsandbox  : %s\nkit      : %s\n' "$WORKSPACE" "$NAME" "${KIT#./kit/}"; check_workspace ;;
+  build|rebuild) need_sbx; build ;;
+  rm)       need_sbx; if sandbox_exists; then destroy; info "removed '$NAME'"; else info "no sandbox for this folder"; fi ;;
+  forget)   if [[ -f "$APPROVED" ]]; then grep -vxF "$WORKSPACE" "$APPROVED" >"$APPROVED.tmp" || true; mv "$APPROVED.tmp" "$APPROVED"; fi
+            rm -rf "$SESSIONS"; info "forgot $WORKSPACE (mount approval and Pi history)" ;;
+  -h|--help|help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$SELF" ;;
+  *)        die "unknown command: $1 (try --help)" ;;
+esac

@@ -1,0 +1,60 @@
+# Python packages for the sandbox venv (/opt/office-py).
+# Locked with hashes into requirements.lock. Regenerate after editing:
+#   uv pip compile --no-header --generate-hashes --python-version 3.12 \
+#     --python-platform aarch64-unknown-linux-gnu requirements.in > requirements.lock
+
+# Word
+python-docx
+docx2python
+docxcompose
+docxtpl
+mammoth
+# Excel / tabular
+openpyxl
+xlsxwriter
+xlrd
+pyxlsb
+odfpy
+pandas
+numpy
+tabulate
+# PowerPoint
+python-pptx
+# Legacy / OLE / Outlook / encrypted Office
+olefile
+oletools
+msoffcrypto-tool
+extract-msg
+# PDF
+pypdf
+pdfplumber
+pymupdf
+reportlab
+pdf2image
+pytesseract
+pillow
+# XML / HTML / Markdown
+lxml
+beautifulsoup4
+defusedxml
+markdown
+markdownify
+html2text
+# Text, NER / PII (hush-anon)
+regex
+rapidfuzz
+chardet
+python-dateutil
+spacy>=3.8,<3.9
+presidio-analyzer
+presidio-anonymizer
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+en_core_web_lg @ https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl
+# General
+jinja2
+pyyaml
+rich
+typer
+ipython
+pytest
+ruff
