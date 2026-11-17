@@ -1,6 +1,7 @@
 # hush
 
-Private, offline AI work on your own files.
+Private, offline AI work on your own files.  A little wrapper for Docker sbx, 
+Pi coding agent and Apple MLX local inference.
 
 `cd` into a folder, run `hush`, and you're talking to **Pi**, a coding agent,
 running in a throwaway Docker Sandbox (`sbx`). It can see only that folder, it
@@ -149,7 +150,7 @@ tail -f .hush/mlx.log
 - "network proxy is not initialized" means you need `sbx daemon restart`.
 - A `BrokenPipeError` in the MLX log is harmless.
 
-## Example: anonymising a document
+## Example Use-Case: anonymising a document
 
 One thing hush is good for is stripping names out of an Office document
 before it goes anywhere else. The image includes `hush-anon`, and Pi uses it
@@ -165,3 +166,31 @@ hush-anon check OUT MAP    # PASS, or shows every leak
 
 Always read the result yourself before sharing it. `check` finds the names
 you mapped, not the ones nobody noticed.
+
+---
+
+# But why?
+
+Why not just use sbx and the Pi Docker image?
+
+Short version: `sbx/pi-image` (via the `sbx/pi-kit` kit) gives you Pi in a sandbox and nothing else. hush adds the parts that make it private and offline: a local model, a locked-down network, Office tooling, and pinned versions. An alias covers how you start it, not what it does.
+
+|                       | `sbx/pi-image` + alias                                                                                | hush                                                                                                                                                                                                                                                                |
+| --------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Model**             | Whatever Pi is configured for, usually a cloud API. Using a local model means setting it up yourself. | Starts and stops a local MLX server on the host (`mlx_serve.py`), lets you pick a model, and writes Pi's `/model` list from `~/models` (`pi_models.py`).                                                                                                            |
+| **Network**           | The kit's default rules. Nothing on the page says it's locked down.                                   | `hush setup` sets the global policy to deny-all. The kit opens only `localhost:8080`. Internet is off by default and asked per session. hush checks the choice actually took effect and won't attach if the network is open when you said offline (`hush:356-360`). |
+| **Base contents**     | Shell base with Docker-in-Docker, Node 22 and npm. Pi installed from npm.                             | Node and npm removed. Pi is the standalone binary. No Docker-in-Docker.                                                                                                                                                                                             |
+| **Document tooling**  | None (fd and ripgrep only)                                                                            | LibreOffice, pandoc, PDF and OCR tools, metric-compatible fonts, a Python Office/PDF stack, and the `hush-anon` anonymisation workflow                                                                                                                              |
+| **Supply chain**      | `latest` tag, rebuilt nightly. Pi updates itself (`pi update --self`).                                | Base image pinned by digest, Pi by SHA-256, Python packages by hash (`requirements.lock`)                                                                                                                                                                           |
+| **Sandbox lifetime**  | Up to you                                                                                             | One throwaway sandbox per session, deleted on exit. `hush rm` cleans up after a killed session.                                                                                                                                                                     |
+| **What gets mounted** | Up to you                                                                                             | Only the current folder, after a one-time approval per folder (`-y` skips it)                                                                                                                                                                                       |
+| **Pi history**        | Lives inside the sandbox unless you persist it                                                        | Kept per folder in `.hush/sessions/<hash>/`, so `/resume` works across throwaway sandboxes                                                                                                                                                                          |
+| **Credentials**       | Pass-through is up to the kit                                                                         | `GH_TOKEN` and the SSH agent are stripped from Pi's environment                                                                                                                                                                                                     |
+| **Agent config**      | Pi defaults                                                                                           | Ships `AGENTS.md` and Pi settings (thinking toggles, model notes)                                                                                                                                                                                                   |
+| **Checks and ops**    | —                                                                                                     | `verify` (model reachable, internet blocked), `status`, `mem`, `where`, `stop`, `forget`                                                                                                                                                                            |
+
+**Where the image wins:** it needs no maintenance, Pi stays current, it has Docker and Node inside if your agent needs them, and it runs on any machine. hush needs Apple Silicon and roughly 35 GB of memory for the default model.
+
+If you don't need offline use, local models or Office files, the image plus an alias is the simpler choice. If you want "nothing leaves the machine" with checks that prove it, an alias doesn't get you there. You'd end up rebuilding most of `hush` around it.
+
+The image's Docker Hub page shows no run command or network policy, so its column assumes the stock `sbx/pi-kit` defaults.
